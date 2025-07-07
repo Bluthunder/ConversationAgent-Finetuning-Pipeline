@@ -1,6 +1,6 @@
 # app.py
-from lightning.app import LightningApp, LightningFlow
-from lightning.app.components import PythonScript
+from lightning import LightningApp, LightningFlow
+from lightning import PythonScript
 
 class FinetuneFlow(LightningFlow):
     def __init__(self):
@@ -14,3 +14,5 @@ class FinetuneFlow(LightningFlow):
             print("✅ Training Complete!")
 
 app = LightningApp(FinetuneFlow())
+
+

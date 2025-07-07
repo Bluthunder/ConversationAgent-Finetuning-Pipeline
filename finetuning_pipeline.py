@@ -1,16 +1,18 @@
+# lightning_mistral_pipeline.py
+
 import os
-import json
+from sklearn.metrics import precision_recall_fscore_support
 from lightning import LightningModule, LightningDataModule, Trainer
 from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
-from lightning.pytorch.loggers import MLFlowLogger
 from datasets import load_dataset, concatenate_datasets, load_metric
 from torch.utils.data import DataLoader
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, AdamW, get_cosine_schedule_with_warmup
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, AdamW
 
 class MultiTaskDataModule(LightningDataModule):
-    def __init__(self, nlu_train_path, nlg_train_path, nlg_val_path, tokenizer, batch_size=4):
+    def __init__(self, nlu_train_path, nlu_val_path, nlg_train_path, nlg_val_path, tokenizer, batch_size=4):
         super().__init__()
         self.nlu_train_path = nlu_train_path
+        self.nlu_val_path = nlu_val_path
         self.nlg_train_path = nlg_train_path
         self.nlg_val_path = nlg_val_path
         self.tokenizer = tokenizer
@@ -19,7 +21,6 @@ class MultiTaskDataModule(LightningDataModule):
     def setup(self, stage=None):
         nlu_ds = load_dataset("json", data_files=self.nlu_train_path, split="train")
         nlg_ds = load_dataset("json", data_files=self.nlg_train_path, split="train")
-        self.val_dataset = load_dataset("json", data_files=self.nlg_val_path, split="train")
 
         def tokenize_nlu(example):
             prompt = f"<s>[INST] {example['text']} [/INST]"
@@ -38,13 +39,28 @@ class MultiTaskDataModule(LightningDataModule):
         nlu_ds = nlu_ds.map(tokenize_nlu)
         nlg_ds = nlg_ds.map(tokenize_nlg)
         self.train_dataset = concatenate_datasets([nlu_ds, nlg_ds])
-        self.val_dataset = self.val_dataset.map(tokenize_nlg)
+
+        self.nlu_val_dataset = None
+        self.nlg_val_dataset = None
+
+        if self.nlu_val_path:
+            nlu_val_ds = load_dataset("json", data_files=self.nlu_val_path, split="train")
+            self.nlu_val_dataset = nlu_val_ds.map(tokenize_nlu)
+
+        if self.nlg_val_path:
+            nlg_val_ds = load_dataset("json", data_files=self.nlg_val_path, split="train")
+            self.nlg_val_dataset = nlg_val_ds.map(tokenize_nlg)
 
     def train_dataloader(self):
         return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=4, pin_memory=True)
 
     def val_dataloader(self):
-        return DataLoader(self.val_dataset, batch_size=self.batch_size, num_workers=4, pin_memory=True)
+        dataloaders = []
+        if self.nlu_val_dataset:
+            dataloaders.append(DataLoader(self.nlu_val_dataset, batch_size=self.batch_size, num_workers=4, pin_memory=True))
+        if self.nlg_val_dataset:
+            dataloaders.append(DataLoader(self.nlg_val_dataset, batch_size=self.batch_size, num_workers=4, pin_memory=True))
+        return dataloaders if dataloaders else None
 
 
 class MultiTaskModel(LightningModule):
@@ -54,64 +70,81 @@ class MultiTaskModel(LightningModule):
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.bleu = load_metric("bleu")
         self.rouge = load_metric("rouge")
+        self.intent_preds, self.intent_labels = [], []
+        self.sentiment_preds, self.sentiment_labels = [], []
+        self.ner_preds, self.ner_labels = [], []
 
     def forward(self, input_ids, attention_mask, labels=None):
         return self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
 
     def training_step(self, batch, batch_idx):
         outputs = self(**batch)
-        self.log("train_loss", outputs.loss, prog_bar=True)
-        return outputs.loss
+        loss = outputs.loss
+        self.log("train_loss", loss)
+        return loss
 
-    def validation_step(self, batch, batch_idx):
-        outputs = self(**batch)
-        self.log("val_loss", outputs.loss, prog_bar=True)
+    def validation_step(self, batch, batch_idx, dataloader_idx=0):
+        outputs = self.model.generate(batch['input_ids'], attention_mask=batch['attention_mask'], max_length=128)
+        preds = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
+        labels = self.tokenizer.batch_decode(batch['labels'], skip_special_tokens=True)
 
-        generated_ids = self.model.generate(batch["input_ids"], max_new_tokens=64)
-        preds = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
-        labels = self.tokenizer.batch_decode(batch["labels"], skip_special_tokens=True)
+        if dataloader_idx == 0:
+            for pred, label in zip(preds, labels):
+                if "Intent:" in pred and "Intent:" in label:
+                    self.intent_preds.append(pred.split("Intent:")[1].split("\n")[0].strip())
+                    self.intent_labels.append(label.split("Intent:")[1].split("\n")[0].strip())
+                if "Sentiment:" in pred and "Sentiment:" in label:
+                    self.sentiment_preds.append(pred.split("Sentiment:")[1].split("\n")[0].strip())
+                    self.sentiment_labels.append(label.split("Sentiment:")[1].split("\n")[0].strip())
+                if "NER:" in pred and "NER:" in label:
+                    self.ner_preds.append(pred.split("NER:")[1].strip())
+                    self.ner_labels.append(label.split("NER:")[1].strip())
 
-        self.bleu.add_batch(predictions=[pred.split() for pred in preds], references=[[label.split()] for label in labels])
-        self.rouge.add_batch(predictions=preds, references=labels)
-
-        if batch_idx == 0:
-            self.logger.experiment.log_text("sample_preds", preds[0])
+        elif dataloader_idx == 1:
+            self.bleu.add_batch(predictions=[p.split() for p in preds], references=[[l.split()] for l in labels])
+            self.rouge.add_batch(predictions=preds, references=labels)
 
     def on_validation_epoch_end(self):
-        bleu_score = self.bleu.compute()["bleu"]
-        rouge_score = self.rouge.compute()["rougeL"].mid.fmeasure
+        if self.intent_preds and self.intent_labels:
+            prec, rec, f1, _ = precision_recall_fscore_support(self.intent_labels, self.intent_preds, average="weighted", zero_division=0)
+            self.log_dict({"nlu/intent_precision": prec, "nlu/intent_recall": rec, "nlu/intent_f1": f1})
 
-        self.log("bleu", bleu_score, prog_bar=True)
-        self.log("rougeL", rouge_score, prog_bar=True)
+        if self.sentiment_preds and self.sentiment_labels:
+            prec, rec, f1, _ = precision_recall_fscore_support(self.sentiment_labels, self.sentiment_preds, average="weighted", zero_division=0)
+            self.log_dict({"nlu/sentiment_precision": prec, "nlu/sentiment_recall": rec, "nlu/sentiment_f1": f1})
 
-        metrics = {"bleu": bleu_score, "rougeL": rouge_score}
-        with open("nlg_metrics.json", "w") as f:
-            json.dump(metrics, f)
+        if self.ner_preds and self.ner_labels:
+            prec, rec, f1, _ = precision_recall_fscore_support(self.ner_labels, self.ner_preds, average="weighted", zero_division=0)
+            self.log_dict({"nlu/ner_precision": prec, "nlu/ner_recall": rec, "nlu/ner_f1": f1})
 
-        self.logger.experiment.log_artifact(
-            local_path="nlg_metrics.json",
-            artifact_path="metrics"
-        )
+        if hasattr(self, "bleu") and hasattr(self, "rouge"):
+            rouge_scores = self.rouge.compute()
+            bleu_score = self.bleu.compute()
+            self.log("nlg/bleu", bleu_score["bleu"])
+            self.log("nlg/rougeL", rouge_scores["rougeL"].mid.fmeasure)
+
+        self.intent_preds, self.intent_labels = [], []
+        self.sentiment_preds, self.sentiment_labels = [], []
+        self.ner_preds, self.ner_labels = [], []
 
     def configure_optimizers(self):
-        optimizer = AdamW(self.parameters(), lr=5e-5, weight_decay=0.01)
-        scheduler = get_cosine_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=100,
-            num_training_steps=1000
-        )
-        return [optimizer], [scheduler]
+        optimizer = AdamW(self.parameters(), lr=2e-5)
+        return optimizer
 
 
 def main():
+    
     model_name = "mistralai/Mistral-7B-Instruct-v0.2"
     nlu_train_path = "s3://your-bucket/nlu_train.jsonl"
+    nlu_val_path = "s3://your-bucket/nlu_val.jsonl"
     nlg_train_path = "s3://your-bucket/nlg_train.jsonl"
     nlg_val_path = "s3://your-bucket/nlg_val.jsonl"
+
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     data_module = MultiTaskDataModule(
         nlu_train_path=nlu_train_path,
+        nlu_val_path=nlu_val_path,
         nlg_train_path=nlg_train_path,
         nlg_val_path=nlg_val_path,
         tokenizer=tokenizer
@@ -128,14 +161,9 @@ def main():
 
     lr_monitor = LearningRateMonitor(logging_interval="step")
 
-    logger = MLFlowLogger(
-        experiment_name="Mistral-7B-NLU-NLG",
-        tracking_uri=os.getenv("MLFLOW_TRACKING_URI", "file:./mlruns")
-    )
-
     trainer = Trainer(
         max_epochs=5,
-        logger=logger,
+        logger=True,
         callbacks=[checkpoint_callback, lr_monitor],
         precision=16,
         accelerator="gpu",
